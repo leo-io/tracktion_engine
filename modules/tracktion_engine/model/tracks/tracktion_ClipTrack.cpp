@@ -12,6 +12,13 @@ namespace tracktion { inline namespace engine
 {
 
 //==============================================================================
+// Keeps the track's CollectionClips in sync with the clips' group IDs.
+//
+// CollectionClips aren't stored in the ValueTree - they're derived groupings, one
+// per distinct group ID, that let several grouped clips be treated as a single
+// TrackItem. This listener watches the track's clip state and rebuilds the groupings
+// as clips are added, removed, re-grouped or moved, marking trackItemsDirty so the
+// cached track-item list is regenerated lazily on next access.
 struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
 {
     CollectionClipList (ClipTrack& t, juce::ValueTree& v) : ct (t), state (v)
@@ -28,6 +35,8 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
     {
         if (id == IDs::groupID)
         {
+            // A clip's group membership changed. First detach it from any collection
+            // that still holds it (deleting that collection if it's now empty)...
             if (auto c = ct.findClipForID (EditItemID::fromID (v)))
             {
                 for (auto cc : collectionClips)
@@ -48,6 +57,9 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
                     }
                 }
 
+                // ...then add it to the collection for its new group, creating one
+                // if needed. The clip is deselected so the collection (not the clip)
+                // becomes the selectable unit.
                 if (c->isGrouped())
                 {
                     auto cc = findOrCreateCollectionClip (c->getGroupID());
@@ -61,6 +73,8 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         }
         else if (id == IDs::start || id == IDs::length)
         {
+            // A grouped clip moved or resized, so its collection's overall span may
+            // have changed - recompute the collection's start/end.
             if (auto c = ct.findClipForID (EditItemID::fromID (v)))
             {
                 if (c->isGrouped())
@@ -75,6 +89,8 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         }
     }
 
+    // A clip was added to the track: if it belongs to a group, slot it into the
+    // matching collection.
     void valueTreeChildAdded (juce::ValueTree&, juce::ValueTree& child) override
     {
         if (Clip::isClipState (child))
@@ -92,6 +108,8 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         }
     }
 
+    // A clip was removed from the track: pull it out of whichever collection holds
+    // it (by ID, since the Clip object may already be gone) and drop empty collections.
     void valueTreeChildRemoved (juce::ValueTree&, juce::ValueTree& child, int) override
     {
         if (Clip::isClipState (child))
@@ -114,6 +132,7 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         }
     }
 
+    // Returns the collection for a group ID, creating an empty one if none exists yet.
     CollectionClip* findOrCreateCollectionClip (EditItemID groupID)
     {
         for (auto cc : collectionClips)
@@ -128,6 +147,7 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         return cc;
     }
 
+    // Returns the collection for a group ID, or null if there isn't one.
     CollectionClip* findCollectionClip (EditItemID groupID)
     {
         for (auto cc : collectionClips)
@@ -137,6 +157,8 @@ struct ClipTrack::CollectionClipList  : public juce::ValueTree::Listener
         return {};
     }
 
+    // Called by ClipTrack when a grouped clip is first created (the ValueTree child
+    // may already have existed before the listener could see it being added).
     void clipCreated (Clip& c)
     {
         auto cc = findOrCreateCollectionClip (c.getGroupID());
@@ -165,6 +187,8 @@ ClipTrack::ClipTrack (Edit& ed, const juce::ValueTree& v, bool hasModifierList)
 
 ClipTrack::~ClipTrack()
 {
+    // Release any ARA (plugin-side audio analysis) resources the clips hold before
+    // the track and its clips are destroyed.
     for (auto c : getClips())
         if (auto acb = dynamic_cast<AudioClipBase*> (c))
             acb->tearDownARA();
@@ -172,10 +196,14 @@ ClipTrack::~ClipTrack()
 
 void ClipTrack::initialise()
 {
+    // Wire up the ClipOwner half of this object (which manages the actual Clip
+    // instances) before the Track half initialises.
     initialiseClipOwner (edit, state);
     Track::initialise();
 }
 
+// Pushes any cached/in-memory state (track + each clip) back into the ValueTree so
+// it's up to date before the Edit is saved.
 void ClipTrack::flushStateToValueTree()
 {
     Track::flushStateToValueTree();
@@ -185,6 +213,9 @@ void ClipTrack::flushStateToValueTree()
 }
 
 //==============================================================================
+// Rebuilds the cached, time-sorted list of TrackItems (clips + collection clips)
+// if it's been marked dirty. This list backs the getNumTrackItems/getTrackItem
+// queries; caching it avoids re-sorting on every access while clips are unchanged.
 void ClipTrack::refreshTrackItems() const
 {
     TRACKTION_ASSERT_MESSAGE_THREAD
@@ -278,6 +309,8 @@ bool ClipTrack::contains (CollectionClip* cc) const
 }
 
 //==============================================================================
+// Finds a clip on this track by ID, searching both the arrangement clips and (for
+// audio tracks) the launcher clip slots.
 Clip* ClipTrack::findClipForID (EditItemID id) const
 {
     for (auto c : getClips())
@@ -298,6 +331,9 @@ TimeDuration ClipTrack::getLength() const
     return toDuration (getTotalRange().getEnd());
 }
 
+// The track's length extended to cover any tracks that feed into it (e.g. a
+// submix/aux source), recursing through the input chain so the longest contributor
+// determines the result.
 TimeDuration ClipTrack::getLengthIncludingInputTracks() const
 {
     auto l = getLength();
@@ -309,11 +345,15 @@ TimeDuration ClipTrack::getLengthIncludingInputTracks() const
     return l;
 }
 
+// The span from the earliest clip start to the latest clip end on this track.
 TimeRange ClipTrack::getTotalRange() const
 {
     return findUnionOfEditTimeRanges (getClips());
 }
 
+// Re-parents an existing clip onto this track (used when moving a clip between
+// tracks), enforcing the per-track clip limit. Reparenting the clip's ValueTree is
+// what actually moves it; the ClipOwner machinery picks up the change.
 bool ClipTrack::addClip (const Clip::Ptr& clip)
 {
     CRASH_TRACER
@@ -339,6 +379,8 @@ bool ClipTrack::addClip (const Clip::Ptr& clip)
     return false;
 }
 
+// Adds an externally-built CollectionClip, replacing any auto-generated collection
+// that already contains its clips so we don't end up with duplicates.
 void ClipTrack::addCollectionClip (CollectionClip* cc)
 {
     CollectionClip::Ptr refHolder (cc);
@@ -357,6 +399,10 @@ void ClipTrack::removeCollectionClip (CollectionClip* cc)
 }
 
 //==============================================================================
+// The insert* methods are thin wrappers over the free functions in the engine
+// namespace (see tracktion_EditUtilities) that do the real work of creating clips,
+// finding a free slot, deleting overlaps etc. They're exposed here for convenience
+// and to optionally select the newly-created clip via a SelectionManager.
 Clip* ClipTrack::insertClipWithState (juce::ValueTree clipState)
 {
     return engine::insertClipWithState (*this, clipState);
@@ -407,6 +453,9 @@ EditClip::Ptr ClipTrack::insertEditClip (TimeRange position, ProjectItemID sourc
     return engine::insertEditClip (*this, position, sourceID);
 }
 
+// Erases a time range across all clips on the track. Clips wholly inside vanish;
+// clips straddling the range are trimmed or split, and any resulting new clips are
+// added to the selection.
 void ClipTrack::deleteRegion (TimeRange range, SelectionManager* sm)
 {
     auto newClips = engine::deleteRegion (*this, range);
@@ -416,6 +465,7 @@ void ClipTrack::deleteRegion (TimeRange range, SelectionManager* sm)
             sm->addToSelection (newClip);
 }
 
+// As deleteRegion, but limited to a single clip (the rest of the track is untouched).
 void ClipTrack::deleteRegionOfClip (Clip::Ptr c, TimeRange range, SelectionManager* sm)
 {
     jassert (c != nullptr);
@@ -459,6 +509,8 @@ bool ClipTrack::containsAnyMIDIClips() const
     return engine::containsAnyMIDIClips (*this);
 }
 
+// ClipOwner interface: tells the shared clip-management code where this owner's
+// state lives, who it is, and how to select it.
 juce::ValueTree& ClipTrack::getClipOwnerState()
 {
     return state;
@@ -479,6 +531,12 @@ Edit& ClipTrack::getClipOwnerEdit()
     return edit;
 }
 
+//==============================================================================
+// ClipOwner notification callbacks. The ClipOwner base calls these as its clip
+// collection changes so the track can update derived state. Each invalidates the
+// cached track-item list; structural changes also break any group freeze (a bounced
+// version of the track is no longer valid once its clips change) and broadcast a
+// change for listeners/graph rebuild.
 void ClipTrack::clipCreated (Clip& c)
 {
     if (c.isGrouped())
@@ -506,6 +564,8 @@ void ClipTrack::clipPositionChanged()
     trackItemsDirty = true;
 }
 
+// Bumps the trailing number of a string ("Take 1" -> "Take 2"), or appends " 2" if
+// there's no trailing number. Used to make unique names for split/duplicated clips.
 inline juce::String incrementLastDigit (const juce::String& in)
 {
     int digitCount = 0;
@@ -525,16 +585,21 @@ inline juce::String incrementLastDigit (const juce::String& in)
             + juce::String (in.getTrailingIntValue() + 1);
 }
 
+// Splits a single clip in two at 'time', returning the newly-created right-hand clip.
 Clip* ClipTrack::splitClip (Clip& clip, const TimePosition time)
 {
     return split (clip, time);
 }
 
+// Splits every clip on the track that spans 'time'.
 void ClipTrack::splitAt (TimePosition time)
 {
     engine::split (*this, time);
 }
 
+// Shifts every clip whose centre is at/after 'time' later by amountOfSpace,
+// inserting a gap (e.g. to make room for new material). Iterating from the end and
+// collecting first avoids re-processing clips as the sorted order changes mid-move.
 void ClipTrack::insertSpaceIntoTrack (TimePosition time, TimeDuration amountOfSpace)
 {
     CRASH_TRACER
@@ -559,6 +624,8 @@ void ClipTrack::insertSpaceIntoTrack (TimePosition time, TimeDuration amountOfSp
             c->setStart (c->getPosition().getStart() + amountOfSpace, false, true);
 }
 
+// Collects all "interesting" times across the track's clips (clip starts/ends,
+// loop points etc.) - used to drive snapping and next/previous-edit navigation.
 juce::Array<TimePosition> ClipTrack::findAllTimesOfInterest()
 {
     juce::Array<TimePosition> cuts;
@@ -570,6 +637,8 @@ juce::Array<TimePosition> ClipTrack::findAllTimesOfInterest()
     return cuts;
 }
 
+// Returns the first time of interest strictly after t (with a small epsilon to
+// skip the current position), or the track end if there's nothing further.
 TimePosition ClipTrack::getNextTimeOfInterest (TimePosition t)
 {
     if (t < TimePosition())
@@ -582,6 +651,8 @@ TimePosition ClipTrack::getNextTimeOfInterest (TimePosition t)
     return toPosition (getLength());
 }
 
+// Returns the last time of interest strictly before t, or an empty position if
+// there's nothing earlier.
 TimePosition ClipTrack::getPreviousTimeOfInterest (TimePosition t)
 {
     if (t < TimePosition())
@@ -596,6 +667,7 @@ TimePosition ClipTrack::getPreviousTimeOfInterest (TimePosition t)
     return {};
 }
 
+// Searches both the track's own plugin chain and any per-clip plugin lists.
 bool ClipTrack::containsPlugin (const Plugin* plugin) const
 {
     if (pluginList.contains (plugin))
@@ -609,6 +681,9 @@ bool ClipTrack::containsPlugin (const Plugin* plugin) const
     return false;
 }
 
+// Gathers every plugin reachable from this track: the track chain (via the base
+// class), each clip's plugins, and - for container clips - the plugins on their
+// nested child clips too.
 Plugin::Array ClipTrack::getAllPlugins() const
 {
     auto destArray = Track::getAllPlugins();
@@ -633,6 +708,8 @@ void ClipTrack::sendMirrorUpdateToAllPlugins (Plugin& p) const
         c->sendMirrorUpdateToAllPlugins (p);
 }
 
+// True if any audio clip on the track references the given file - used e.g. to
+// decide whether a file is still needed or can be purged from caches.
 bool ClipTrack::areAnyClipsUsingFile (const AudioFile& af)
 {
     for (auto c : getClips())

@@ -13,10 +13,20 @@ namespace tracktion { inline namespace engine
 
 //==============================================================================
 /**
-    A clip that can contain multiple other clips and mix their output together.
+    A clip that itself contains an ordered collection of other clips and mixes their
+    output down to a single audio stream.
 
-    This makes it possible to group, move, add effects etc. to a number of clips
-    easily.
+    ContainerClip is the clip-level analogue of a submix FolderTrack: by inheriting both
+    AudioClipBase (so it behaves as one audio region on its parent track, with fades,
+    gain/pan, plugins and proxy rendering) and ClipOwner (so it nests child clips), it
+    lets a number of clips be grouped, moved, looped and processed together as a unit.
+
+    The child clips are summed and rendered through this clip's own processing, meaning
+    you can drop effects on the container to apply them to the whole group, or warp/loop
+    the group as one. The nested timeline is positioned relative to the container's own
+    start/offset.
+
+    @see AudioClipBase, ClipOwner, FolderTrack
 */
 class ContainerClip  : public AudioClipBase,
                        public ClipOwner

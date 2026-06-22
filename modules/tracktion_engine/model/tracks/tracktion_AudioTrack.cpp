@@ -12,6 +12,9 @@ namespace tracktion { inline namespace engine
 {
 
 //==============================================================================
+// One-shot helper that flushes hanging MIDI notes when a MIDI clip is muted.
+// Muting a clip mid-note would otherwise leave the synth holding notes on, so this
+// asynchronously sends "all notes off" on every channel, then deletes itself.
 struct AudioTrack::TrackMuter  : private juce::AsyncUpdater
 {
     TrackMuter (AudioTrack& at) : owner (at)        { triggerAsyncUpdate(); }
@@ -30,6 +33,15 @@ struct AudioTrack::TrackMuter  : private juce::AsyncUpdater
 };
 
 //==============================================================================
+// Watches the track state and keeps the individual-freeze flag consistent.
+//
+// It serves two jobs, both deferred onto the message queue via AsyncUpdater:
+//   - triggerFreeze: an explicit async freeze request (freezeTrackAsync) - freeze
+//     the track unless it's already group-frozen.
+//   - updateFreeze: any state change - if the track claims to be individually
+//     frozen but its FreezePointPlugin has gone, drop the frozen flag.
+// During Edit load the listener is attached only once loading finishes, so we don't
+// react to the flood of property sets that loading produces.
 struct AudioTrack::FreezeUpdater : private ValueTreeAllEventListener,
                                    private juce::AsyncUpdater
 {
@@ -101,6 +113,10 @@ private:
 };
 
 //==============================================================================
+// Sets up the track: binds the CachedValues to their ValueTree properties, then
+// (on the message thread, via callBlocking) creates the per-track virtual wave and
+// MIDI input devices that recording/monitoring routes through, the TrackOutput that
+// routes this track's signal onward, and the FreezeUpdater.
 AudioTrack::AudioTrack (Edit& ed, const juce::ValueTree& v)
     : ClipTrack (ed, v, true),
       MacroParameterElement (ed, v)
@@ -141,10 +157,13 @@ AudioTrack::AudioTrack (Edit& ed, const juce::ValueTree& v)
     output = std::make_unique<TrackOutput> (*this);
     freezeUpdater = std::make_unique<FreezeUpdater> (*this);
 
+    // Reset the MIDI editor's vertical zoom/scroll if the stored values are out of range.
     if (getMidiVerticalOffset() < 0 || getMidiVerticalOffset() > 0.99
          || getMidiVisibleProportion() < 0.1 || getMidiVisibleProportion() > 1.0)
         setVerticalScaleToDefault();
 
+    // Coalesced refresh of auto-crossfades: when a clip start/length changes we
+    // re-evaluate overlaps once asynchronously rather than per property change.
     asyncCaller.addFunction (updateAutoCrossfadesFlag,
                              [this]
                              {
@@ -157,6 +176,8 @@ AudioTrack::AudioTrack (Edit& ed, const juce::ValueTree& v)
 
 AudioTrack::~AudioTrack()
 {
+    // If this track's input devices were in use, tear down playback and detach them
+    // from every track they were assigned to before this object disappears.
     const bool clearWave = waveInputDevice != nullptr && waveInputDevice->isEnabled();
     const bool clearMidi = midiInputDevice != nullptr && midiInputDevice->isEnabled();
 
@@ -180,15 +201,20 @@ void AudioTrack::initialise()
 
     ClipTrack::initialise();
 
+    // Make sure there's one launcher clip slot per scene.
     if (! edit.isLoading())
         getClipSlotList().ensureNumberOfSlots (edit.getSceneList().getNumScenes());
 
+    // A frozen flag is meaningless without its rendered file - clear it if missing.
     if (frozenIndividually && ! getFreezeFile().existsAsFile())
         setFrozen (false, individualFreeze);
 
     output->initialise();
 }
 
+// Keeps the stored name tidy and propagates it to the input devices. A name that's
+// just "Track <n>" is cleared so the track falls back to its dynamic numbered name
+// (which stays correct as tracks are reordered).
 void AudioTrack::sanityCheckName()
 {
     auto n = ClipTrack::getName();
@@ -210,6 +236,7 @@ void AudioTrack::sanityCheckName()
     if (midiInputDevice != nullptr) midiInputDevice->setAlias (devName);
 }
 
+// Returns the user-set name, or a generated "Track <n>" if none has been set.
 juce::String AudioTrack::getName() const
 {
     if (auto n = ClipTrack::getName(); ! n.isEmpty())
@@ -218,6 +245,8 @@ juce::String AudioTrack::getName() const
     return getNameAsTrackNumber();
 }
 
+// The track's 1-based position among audio tracks (counting recursively through
+// folders), used for the default "Track N" name.
 int AudioTrack::getAudioTrackNumber() const noexcept
 {
     int result = 1;
@@ -256,10 +285,14 @@ juce::String AudioTrack::getSelectableDescription()
     return getNameAsTrackNumberWithDescription();
 }
 
+// Convenience lookups for the standard built-in plugins the engine puts on a track
+// (returns the last of each type, i.e. the one nearest the output).
 VolumeAndPanPlugin* AudioTrack::getVolumePlugin()     { return pluginList.getPluginsOfType<VolumeAndPanPlugin>().getLast(); }
 LevelMeterPlugin* AudioTrack::getLevelMeterPlugin()   { return pluginList.getPluginsOfType<LevelMeterPlugin>().getLast(); }
 EqualiserPlugin* AudioTrack::getEqualiserPlugin()     { return pluginList.getPluginsOfType<EqualiserPlugin>().getLast(); }
 
+// Finds an aux-send plugin, selected either by its bus number or by its ordinal
+// position among the aux sends on this track.
 AuxSendPlugin* AudioTrack::getAuxSendPlugin (int bus, AuxPosition ap) const
 {
     if (ap == AuxPosition::byBus)
@@ -290,6 +323,9 @@ AuxSendPlugin* AudioTrack::getAuxSendPlugin (int bus, AuxPosition ap) const
 }
 
 //==============================================================================
+// Resolves a display name for a MIDI note. Search order: this track's custom note
+// map, then its plugins, then the destination track, then the master plugins, then
+// the MIDI output device, finally falling back to standard note/drum names.
 juce::String AudioTrack::getNameForMidiNoteNumber (int note, int midiChannel, bool preferSharp) const
 {
     jassert (midiChannel > 0);
@@ -326,6 +362,8 @@ juce::String AudioTrack::getNameForMidiNoteNumber (int note, int midiChannel, bo
                                                                    edit.engine.getEngineBehaviour().getMiddleCOctave());
 }
 
+// Parses the user-supplied note-name map (one "78 Some name" entry per line, '//'
+// for comments) into a fast int->name lookup used by getNameForMidiNoteNumber.
 void AudioTrack::updateMidiNoteMapCache()
 {
     midiNoteMapCache.clear();
@@ -354,6 +392,9 @@ void AudioTrack::updateMidiNoteMapCache()
     }
 }
 
+// The following bank/program-name lookups follow the same fallback chain as
+// getNameForMidiNoteNumber: this track's plugins -> destination track -> master
+// plugins -> MIDI output device -> a sensible default.
 bool AudioTrack::areMidiPatchesZeroBased() const
 {
     // do something for plugins here
@@ -423,10 +464,15 @@ juce::String AudioTrack::getNameForProgramNumber (int programNumber, int bank) c
 }
 
 //==============================================================================
+// Mute/solo state. The setters just write the flag; the actual audibility decision
+// is made by the Edit (which weighs every track's solo/mute) and applied via
+// Track::updateAudibility.
 void AudioTrack::setMute (bool b)           { muted = b; }
 void AudioTrack::setSolo (bool b)           { soloed = b; }
 void AudioTrack::setSoloIsolate (bool b)    { soloIsolated = b; }
 
+// Muted if explicitly muted, or - when includeMutingByDestination is set -
+// implicitly muted because a folder/destination track it feeds is muted.
 bool AudioTrack::isMuted (bool includeMutingByDestination) const
 {
     if (muted)
@@ -444,6 +490,8 @@ bool AudioTrack::isMuted (bool includeMutingByDestination) const
     return false;
 }
 
+// Soloed if explicitly soloed, or - with includeIndirectSolo - implicitly soloed
+// because a parent folder or (unless part of a submix) a destination track is soloed.
 bool AudioTrack::isSolo (bool includeIndirectSolo) const
 {
     if (soloed)
@@ -493,6 +541,9 @@ static bool isInputTrackSolo (const Track& track)
     return false;
 }
 
+// A track must stay audible if one of its input/source tracks is soloed (otherwise
+// the soloed source would be silenced by this track being muted), even when the
+// normal solo logic would hide it.
 bool AudioTrack::isTrackAudible (bool areAnyTracksSolo) const
 {
     if (areAnyTracksSolo && isInputTrackSolo (*this))
@@ -502,6 +553,9 @@ bool AudioTrack::isTrackAudible (bool areAnyTracksSolo) const
 }
 
 //==============================================================================
+// Returns a user-facing warning if the arrangement clips on this track can't be
+// heard given its routing/plugins (MIDI with no synth/MIDI out, or wave blocked by
+// the output or a plugin that doesn't pass audio), or "" if everything's fine.
 juce::String AudioTrack::getTrackPlayabilityWarning() const
 {
     bool hasMidi = false, hasWave = false;
@@ -536,6 +590,8 @@ juce::String AudioTrack::getTrackPlayabilityWarning() const
     return {};
 }
 
+// As getTrackPlayabilityWarning, but inspects the launcher clip slots instead of
+// the arrangement clips.
 juce::String AudioTrack::getLauncherPlayabilityWarning() const
 {
     bool hasMidi = false, hasWave = false;
@@ -579,6 +635,8 @@ juce::String AudioTrack::getLauncherPlayabilityWarning() const
     return {};
 }
 
+// Audio can reach the output only if the output accepts audio and every plugin in
+// the chain passes audio through (a synth that takes only MIDI in would block it).
 bool AudioTrack::canPlayAudio() const
 {
     if (! getOutput().canPlayAudio())
@@ -591,6 +649,8 @@ bool AudioTrack::canPlayAudio() const
     return true;
 }
 
+// MIDI is playable if the output is a MIDI device, or a plugin (here or on a parent
+// submix) accepts MIDI and turns it into audio that can reach an audio output.
 bool AudioTrack::canPlayMidi() const
 {
     if (getOutput().canPlayMidi())
@@ -610,6 +670,8 @@ bool AudioTrack::canPlayMidi() const
 }
 
 //==============================================================================
+// Lazily creates the launcher clip-slot list (and its backing CLIPSLOTS child) on
+// first access.
 ClipSlotList& AudioTrack::getClipSlotList()
 {
     if (! clipSlotList)
@@ -619,6 +681,8 @@ ClipSlotList& AudioTrack::getClipSlotList()
 }
 
 //==============================================================================
+// Vertical zoom/scroll state for the inline MIDI note editor: midiVProp is the
+// fraction of the 128-note range that's visible, midiVOffset is the scroll position.
 double AudioTrack::getMidiVerticalOffset() const
 {
     return state.getProperty (IDs::midiVOffset, juce::var (defaultMidiVerticalOffset));
@@ -651,6 +715,8 @@ void AudioTrack::setVerticalScaleToDefault()
     state.removeProperty (IDs::midiVProp, nullptr);
 }
 
+// "Ghost" tracks are other tracks whose notes are drawn faintly behind this track's
+// MIDI editor for reference. Stored as a list of track IDs.
 void AudioTrack::setTrackToGhost (AudioTrack* track, bool shouldGhost)
 {
     if (track == nullptr)
@@ -684,6 +750,10 @@ juce::Array<AudioTrack*> AudioTrack::getGhostTracks() const
     return tracks;
 }
 
+// "Guide notes" are the audible preview notes played when the user clicks/drags in
+// the MIDI editor or piano keyboard. They're injected straight into the live MIDI
+// stream (not recorded). currentlyPlayingGuideNotes tracks held notes so they can be
+// turned off again; autorelease schedules an automatic note-off via the Timer.
 void AudioTrack::playGuideNote (int note, MidiChannel midiChannel, int velocity, bool stopOtherFirst, bool forceNote, bool autorelease)
 {
     jassert (midiChannel.isValid()); //SysEx?
@@ -734,6 +804,8 @@ void AudioTrack::playGuideNotes (const juce::Array<int>& notes, MidiChannel midi
     }
 }
 
+// Stops all guide notes on every channel (called e.g. on the autorelease timer or
+// when starting a new preview).
 void AudioTrack::turnOffGuideNotes()
 {
     stopTimer();
@@ -754,6 +826,9 @@ void AudioTrack::turnOffGuideNotes (MidiChannel midiChannel)
 }
 
 //==============================================================================
+// Listeners receive live/recorded MIDI generated by this track. Adding the first
+// listener restarts playback so the graph is rebuilt with a node that forwards MIDI
+// to listeners.
 void AudioTrack::addListener (Listener* l)
 {
     if (listeners.isEmpty())
@@ -769,6 +844,10 @@ void AudioTrack::removeListener (Listener* l)
 }
 
 //==============================================================================
+// Reacts to property changes on the track's own state or on its clips. Track-level
+// changes update cached values and trigger the appropriate side effects (clearing
+// inputs, freezing/unfreezing, renaming devices...); clip-level changes drive
+// auto-crossfade refreshes and the mute-time all-notes-off flush.
 void AudioTrack::valueTreePropertyChanged (juce::ValueTree& v, const juce::Identifier& i)
 {
     if (v == state)
@@ -787,6 +866,7 @@ void AudioTrack::valueTreePropertyChanged (juce::ValueTree& v, const juce::Ident
         }
         else if (i == IDs::playSlotClips)
         {
+            // Switching away from launcher playback stops any currently-playing slots.
             playSlotClips.forceUpdateOfCachedValue();
 
             if (! playSlotClips.get())
@@ -829,9 +909,12 @@ void AudioTrack::valueTreePropertyChanged (juce::ValueTree& v, const juce::Ident
     {
         TRACKTION_ASSERT_MESSAGE_THREAD;
 
+        // A clip moved/resized: re-evaluate auto-crossfades with neighbours.
         if (i == IDs::start || i == IDs::length)
             asyncCaller.updateAsync (updateAutoCrossfadesFlag);
 
+        // A MIDI clip was just muted: flush any hanging notes (unless it's set to
+        // keep processing while muted).
         if (i == IDs::mute && bool (v.getProperty (i)))
             if (trackMuter == nullptr && ! bool (v.getProperty (IDs::processMidiWhenMuted, false)))
                 if (v.hasType (IDs::MIDICLIP))
@@ -841,6 +924,8 @@ void AudioTrack::valueTreePropertyChanged (juce::ValueTree& v, const juce::Ident
     ClipTrack::valueTreePropertyChanged (v, i);
 }
 
+// When the track is (re)attached to the Edit, make sure the global scene count is at
+// least as large as this track's number of clip slots.
 void AudioTrack::valueTreeParentChanged (juce::ValueTree& v)
 {
     ClipTrack::valueTreeParentChanged (v);
@@ -851,6 +936,7 @@ void AudioTrack::valueTreeParentChanged (juce::ValueTree& v)
 }
 
 //==============================================================================
+// True if an input device is armed/recording onto this track.
 bool AudioTrack::hasAnyLiveInputs()
 {
     for (auto in : edit.getAllInputDevices())
@@ -860,6 +946,7 @@ bool AudioTrack::hasAnyLiveInputs()
     return false;
 }
 
+// True if another track routes its output into this one (i.e. this is a destination).
 bool AudioTrack::hasAnyTracksFeedingIn()
 {
     for (auto t : getAudioTracks (edit))
@@ -870,6 +957,9 @@ bool AudioTrack::hasAnyTracksFeedingIn()
 }
 
 //==============================================================================
+// Pushes a live MIDI message (soft keyboard, guide note, controller...) into the
+// playback graph by offering it to the listeners. If nothing consumed it, warns the
+// user that the message had nowhere to go.
 void AudioTrack::injectLiveMidiMessage (const MidiMessageWithSource& message)
 {
     TRACKTION_ASSERT_MESSAGE_THREAD
@@ -885,6 +975,9 @@ void AudioTrack::injectLiveMidiMessage (const juce::MidiMessage& m, MPESourceID 
     injectLiveMidiMessage ({ m, source });
 }
 
+// Merges a recorded/imported MIDI sequence into an existing clip on the track. If no
+// target clip is given, picks the first MIDI clip overlapping the sequence's time
+// range. Returns false if there's no suitable clip to merge into.
 bool AudioTrack::mergeInMidiSequence (juce::MidiMessageSequence ms, TimePosition startTime,
                                       MidiClip* mc, MidiList::NoteAutomationType automationType)
 {
@@ -915,6 +1008,9 @@ bool AudioTrack::mergeInMidiSequence (juce::MidiMessageSequence ms, TimePosition
     return false;
 }
 
+// Returns the tracks (audio tracks and submix folders) that route their output into
+// this one, excluding tracks that are part of a submix (those feed their folder, not
+// this track directly).
 juce::Array<Track*> AudioTrack::getInputTracks() const
 {
     juce::Array<Track*> inputTracks;
@@ -941,6 +1037,8 @@ static bool canTrackBeChanged (InputDeviceInstance* idi)
     return true;
 }
 
+// Sets how many simultaneous inputs the track accepts, but refuses to change it
+// while any of its inputs is actively recording.
 void AudioTrack::setMaxNumOfInputs (int n)
 {
     for (auto* idi : edit.getEditInputDevices().getDevicesForTargetTrack (*this))
@@ -951,12 +1049,20 @@ void AudioTrack::setMaxNumOfInputs (int n)
 }
 
 //==============================================================================
+// Freezing renders the track (and its inputs) to an audio file and plays that back
+// instead of processing the live graph, to save CPU. There are two kinds: groupFreeze
+// (several tracks bounced together, tracked by the 'frozen' flag) and individualFreeze
+// (this track alone, tracked by 'frozenIndividually').
 bool AudioTrack::isFrozen (FreezeType t) const
 {
     return t == anyFreeze ? (frozen || frozenIndividually)
                           : (t == groupFreeze ? frozen : frozenIndividually);
 }
 
+// Sets the requested freeze flag, refusing to freeze a track that outputs into
+// another track or a submix (you should freeze the destination instead, since this
+// track's audio isn't independently routable to the render). Setting the flag is
+// what kicks off the actual freeze/unfreeze via valueTreePropertyChanged.
 void AudioTrack::setFrozen (bool b, FreezeType type)
 {
     if (type == individualFreeze)
@@ -1002,6 +1108,8 @@ void AudioTrack::setFrozen (bool b, FreezeType type)
     }
 }
 
+// Audio tracks accept any plugin except a VCA (that's a folder-track concept), and
+// allow at most one FreezePointPlugin.
 bool AudioTrack::canContainPlugin (Plugin* p) const
 {
     const bool isFreezePoint = dynamic_cast<FreezePointPlugin*> (p) != nullptr;
@@ -1012,9 +1120,15 @@ bool AudioTrack::canContainPlugin (Plugin* p) const
 }
 
 //==============================================================================
+// While one of these is alive, unFreezeTrack won't delete the freeze-point plugin -
+// used to keep the freeze point in place across an operation that briefly unfreezes.
 AudioTrack::FreezePointRemovalInhibitor::FreezePointRemovalInhibitor (AudioTrack& at) : track (at)  { ++track.freezePointRemovalInhibitor; }
 AudioTrack::FreezePointRemovalInhibitor::~FreezePointRemovalInhibitor()                             { --track.freezePointRemovalInhibitor; }
 
+// Performs an individual freeze: renders everything up to the freeze point (this
+// track plus any input tracks) to the freeze file, then marks those plugins frozen
+// so the live graph bypasses them and plays the rendered file instead. Mute/solo are
+// temporarily neutralised so the render captures the track in isolation.
 void AudioTrack::freezeTrack()
 {
     insertFreezePointIfRequired();
@@ -1078,6 +1192,8 @@ void AudioTrack::freezeTrack()
     changed();
 }
 
+// Index of the FreezePointPlugin in the plugin chain (the boundary between frozen
+// and live plugins), or -1 if there isn't one.
 int AudioTrack::getIndexOfFreezePoint()
 {
     int i = 0;
@@ -1093,6 +1209,8 @@ int AudioTrack::getIndexOfFreezePoint()
     return -1;
 }
 
+// Places the freeze point immediately after a chosen plugin (replacing any existing
+// one), so everything up to and including that plugin gets baked when frozen.
 void AudioTrack::insertFreezePointAfterPlugin (const Plugin::Ptr& p)
 {
     auto& pl = pluginList;
@@ -1107,6 +1225,7 @@ void AudioTrack::insertFreezePointAfterPlugin (const Plugin::Ptr& p)
     // need to force the audio device to update before we start the render
 }
 
+// Removes any freeze-point plugin(s) from the chain.
 void AudioTrack::removeFreezePoint()
 {
     auto& pl = pluginList;
@@ -1116,6 +1235,8 @@ void AudioTrack::removeFreezePoint()
             f->deleteFromParent();
 }
 
+// Ensures a freeze point exists, inserting one at the default position if needed.
+// Returns true if it had to add one.
 bool AudioTrack::insertFreezePointIfRequired()
 {
     if (getIndexOfFreezePoint() != -1)
@@ -1130,11 +1251,15 @@ bool AudioTrack::insertFreezePointIfRequired()
     return true;
 }
 
+// Requests a freeze on the message loop (safe to call from anywhere) rather than
+// freezing synchronously.
 void AudioTrack::freezeTrackAsync() const
 {
     freezeUpdater->freeze();
 }
 
+// Works out where a new freeze point should go based on the user's freeze-point
+// preference (before all plugins, or pre/post the volume/pan fader).
 int AudioTrack::getIndexOfDefaultFreezePoint()
 {
     int position = edit.engine.getPropertyStorage().getProperty (SettingID::freezePoint, 1);
@@ -1159,6 +1284,8 @@ int AudioTrack::getIndexOfDefaultFreezePoint()
     return -1;
 }
 
+// Marks the plugins whose indices fall in the range as frozen (bypassed in the live
+// graph) and unfreezes the rest.
 void AudioTrack::freezePlugins (juce::Range<int> pluginsToFreeze)
 {
     int i = 0;
@@ -1167,6 +1294,8 @@ void AudioTrack::freezePlugins (juce::Range<int> pluginsToFreeze)
         p->setFrozen (pluginsToFreeze.contains (i++));
 }
 
+// Reverses a freeze: un-bypasses all plugins and removes the freeze point if it's in
+// its default spot (unless something is inhibiting its removal).
 void AudioTrack::unFreezeTrack()
 {
     // Remove the freeze point if it's in the default location as it will be put back there anyway
@@ -1186,11 +1315,14 @@ void AudioTrack::unFreezeTrack()
     changed();
 }
 
+// The temp file the rendered (frozen) audio is written to / played back from.
 juce::File AudioTrack::getFreezeFile() const
 {
     return TemporaryFileManager::getFreezeFileForTrack (*this);
 }
 
+// True if any plugin in the Edit uses this track as its sidechain input - such a
+// track must keep processing even when muted so the sidechain still receives signal.
 bool AudioTrack::isSidechainSource() const
 {
     for (auto p : edit.getPluginCache().getPlugins())
@@ -1200,6 +1332,7 @@ bool AudioTrack::isSidechainSource() const
     return false;
 }
 
+// The reverse lookup: the tracks that feed this track's own plugins' sidechain inputs.
 juce::Array<Track*> AudioTrack::findSidechainSourceTracks() const
 {
     juce::Array<Track*> srcTracks;

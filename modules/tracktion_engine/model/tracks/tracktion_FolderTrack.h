@@ -11,7 +11,26 @@
 namespace tracktion { inline namespace engine
 {
 
-/** */
+/**
+    A track that groups other tracks beneath it, optionally summing their output as a
+    submix bus.
+
+    A FolderTrack has no clips of its own; its children are nested Tracks (held via the
+    Track's sub-track list). It serves two roles:
+
+    - Organisational folder: collapse/expand a group of tracks in the GUI with no effect
+      on the signal flow.
+    - Submix bus: when it owns a TrackOutput (isSubmixFolder() / getOutput()) the audio
+      of all descendant tracks is routed into the folder, processed by the folder's
+      PluginList, and emitted as one signal. This allows shared effects, a single
+      VCA/volume control (getVCAPlugin / getVolumePlugin / getVcaDb) and group muting.
+
+    Mute/solo are aggregated across children (isMuted/isSolo honour the children's and
+    destinations' states), and a folder can be group-frozen. For display it can build
+    CollectionClips spanning the clips of its child tracks (generateCollectionClips).
+
+    @see Track, MasterTrack, TrackOutput, VCAPlugin
+*/
 class FolderTrack  : public Track
 {
 public:

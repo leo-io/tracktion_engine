@@ -13,6 +13,24 @@ namespace tracktion { inline namespace engine
 
 //==============================================================================
 /**
+    A clip that plays a step-sequencer / drum-machine grid rather than free MIDI.
+
+    A StepClip is organised as a small matrix:
+    - Channels (the rows) each map to a fixed MIDI note on a MIDI channel — typically one
+      per drum voice. @see StepClip::Channel
+    - Patterns hold the on/off grid: for every channel a row of steps that say whether
+      that note fires on each step. Steps can also carry per-step velocity, probability
+      and a groove template. @see StepClip::Pattern
+
+    Patterns are referenced over time by the sequence so a clip can switch between
+    several patterns as it plays/loops. At playback the grid is expanded into MIDI
+    note-on/off messages by the playback node; because it produces MIDI, the same
+    midiMessageGenerated Clip::Listener callback applies as for MidiClip.
+
+    It derives directly from Clip (not AudioClipBase) since the source is generated grid
+    data, and broadcasts ChangeBroadcaster messages when the pattern/channel set changes.
+
+    @see Clip, MidiClip, StepClip::Channel, StepClip::Pattern
 */
 class StepClip   : public Clip,
                    public juce::ChangeBroadcaster

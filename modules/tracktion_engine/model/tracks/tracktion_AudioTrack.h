@@ -11,7 +11,34 @@
 namespace tracktion { inline namespace engine
 {
 
-/** */
+/**
+    The standard, signal-producing track: the only Track type that holds audio/MIDI
+    clips, hosts a plugin chain and routes its output to the master or a folder bus.
+
+    AudioTrack extends ClipTrack (so it owns an ordered list of Clips) and adds
+    everything needed to actually make sound:
+
+    - Input: each AudioTrack exposes a WaveInputDevice and MidiInputDevice so live
+      audio/MIDI can be monitored and recorded onto it (acceptsInput() is true).
+      Live MIDI from soft-keyboards or controllers is fed in via injectLiveMidiMessage
+      and the Listener interface.
+    - Processing: the PluginList (inherited from Track) is applied in series; helpers
+      like getVolumePlugin/getLevelMeterPlugin/getEqualiserPlugin locate the standard
+      built-in plugins the engine inserts by default. Output is routed through a
+      TrackOutput (getOutput).
+    - Launcher: alongside the arrangement clips, an AudioTrack owns a ClipSlotList of
+      ClipSlots for the clip-launcher/scene workflow; playSlotClips selects whether the
+      arrangement or the slots are audible.
+    - Freezing: the track can be bounced to an audio file to save CPU, either on its own
+      (individualFreeze) or grouped with others (groupFreeze), via an inserted
+      FreezePointPlugin. @see FreezePointRemovalInhibitor
+
+    Mute/solo are resolved here (including indirect muting/soloing via destination
+    tracks) and feed Track::updateAudibility. Sidechain sources and aux feeds keep
+    processing even while muted — see processAudioNodesWhileMuted.
+
+    @see ClipTrack, TrackOutput, WaveInputDevice, MidiInputDevice, ClipSlotList
+*/
 class AudioTrack  : public ClipTrack,
                     public MacroParameterElement,
                     private juce::Timer

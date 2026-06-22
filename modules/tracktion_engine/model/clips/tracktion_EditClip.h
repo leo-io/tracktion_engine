@@ -13,8 +13,21 @@ namespace tracktion { inline namespace engine
 
 //==============================================================================
 /**
-    This is the main source of an Edit clip and is responsible for managing its
-    properties.
+    An audio clip whose source is another Edit — i.e. a whole sub-session nested as a
+    single clip ("Edits within Edits").
+
+    EditClip references a source Edit by ProjectItemID and treats that Edit's rendered
+    output as its audio material. Because a live Edit can't be streamed cheaply in real
+    time, EditClip is always a render-based AudioClipBase: it bounces the source Edit to
+    a proxy AudioFile (via RenderManager) and plays that, re-rendering when the source
+    changes. It listens to the source through an EditSnapshot so it can invalidate its
+    hash and trigger a re-render when the referenced Edit is edited.
+
+    getWaveInfo()/getSourceLength reflect the rendered proxy's format rather than a file
+    on disk, which is why the source is described by an EditSnapshot instead of a plain
+    AudioFile.
+
+    @see AudioClipBase, EditSnapshot, RenderManager, ProjectItemID
 */
 class EditClip    : public AudioClipBase,
                     private EditSnapshot::Listener

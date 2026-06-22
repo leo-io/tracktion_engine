@@ -11,7 +11,25 @@
 namespace tracktion { inline namespace engine
 {
 
-/** */
+/**
+    A Track that owns a timeline of Clips. The base class for any track whose contents
+    are arrangement clips (AudioTrack, MarkerTrack).
+
+    ClipTrack is where the Track hierarchy meets the ClipOwner hierarchy: by inheriting
+    both it gives a track an ordered, start-time-sorted collection of Clips plus the
+    TrackItem queries the rest of the engine relies on (getNumTrackItems, getTrackItem,
+    getNextTrackItemAt, insertSpaceIntoTrack, splitting and region erasure).
+
+    On top of raw clips it manages CollectionClips — the lightweight groupings used to
+    move/select several clips as one. CollectionClips are not stored in the ValueTree;
+    they're rebuilt from the clips' group IDs and tracked here so the GUI and edit
+    operations can treat a group as a single item.
+
+    It deliberately does not know how clips are turned into sound — that is added by
+    AudioTrack. A ClipTrack on its own simply holds and orders clips.
+
+    @see Track, ClipOwner, AudioTrack, CollectionClip
+*/
 class ClipTrack   : public Track,
                     public ClipOwner
 {
